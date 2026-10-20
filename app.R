@@ -1,8 +1,8 @@
-# Race Course Analyzer ---------------------------------------------------------
+# Grade Expectations -----------------------------------------------------------
 # Upload a GPX file to get:
 #   1. An elevation profile (distance vs. elevation, y-axis not starting at 0)
 #   2. Elevation gain/loss for each mile (final partial mile labeled, e.g. "3.1")
-#   3. Where each mile marker falls on the course (1/2, 1, 2, ...)
+#   3. Where each mile marker falls on the route (1/2, 1, 2, ...)
 #   4. Flat-equivalent distance from Minetti's energy cost of running vs. grade
 #
 # Packages: install.packages(c("shiny", "xml2", "ggplot2", "leaflet"))
@@ -80,6 +80,54 @@ gain_loss <- function(e) {
   c(gain = sum(de[de > 0]), loss = abs(sum(de[de < 0])))
 }
 
+# ---- Segment colors ----------------------------------------------------------
+# The marks cut the route into segments (start -> mark 1 -> ... -> finish), each
+# colored from a sequential ramp shared by the map, the chart and the legend.
+# Ramp: ColorBrewer RdPu, 9-class, as shipped in d3-scale-chromatic
+# (d3.schemeRdPu[9]). Magenta/purple sits opposite green, so it pops on both
+# the street and satellite basemaps. The two lightest steps are dropped: they
+# are near-white and only ~10-13 CIELAB dE apart. The remaining 7 are >= ~15 dE
+# from their neighbours and >= ~42 dE from typical basemap greens, so 7
+# segments (6 marks) is the most we let the user create.
+SEGMENT_PALETTE <- c("#fcc5c0", "#fa9fb5", "#f768a1", "#dd3497",
+                     "#ae017e", "#7a0177", "#49006a")
+MAX_SEGMENTS <- length(SEGMENT_PALETTE)
+MAX_MARKS    <- MAX_SEGMENTS - 1
+
+# k evenly spread steps from the ramp. Fewer than 7 segments skip the palest
+# step so every segment stays clearly visible on a white chart and green map.
+segment_colours <- function(k) {
+  if (k <= 1) return(SEGMENT_PALETTE[5])
+  lo <- if (k >= MAX_SEGMENTS) 1 else 2
+  SEGMENT_PALETTE[round(seq(lo, MAX_SEGMENTS, length.out = k))]
+}
+
+# Cut the route at the marks. Returns one row per track point per segment,
+# with interpolated points at every boundary so neighbouring segments meet.
+# Columns: segment, dist, lat, lon, ele, colour, from, to.
+split_segments <- function(trk, e, mk) {
+  total <- max(trk$dist)
+  eps   <- 1e-6
+  keep  <- if (is.null(mk)) logical(0) else mk$mile > eps & mk$mile < total - eps
+  br    <- c(0, if (length(keep)) mk$mile[keep], total)
+  names <- c("Start", if (length(keep)) mk$label[keep], "Finish")
+  k     <- length(br) - 1
+  cols  <- segment_colours(k)
+  do.call(rbind, lapply(seq_len(k), function(i) {
+    a <- br[i]; b <- br[i + 1]
+    inside <- trk$dist > a & trk$dist < b
+    d <- c(a, trk$dist[inside], b)
+    data.frame(segment = i, dist = d,
+               lat = c(interp_at(trk$dist, trk$lat, a), trk$lat[inside], interp_at(trk$dist, trk$lat, b)),
+               lon = c(interp_at(trk$dist, trk$lon, a), trk$lon[inside], interp_at(trk$dist, trk$lon, b)),
+               ele = c(interp_at(trk$dist, e, a), e[inside], interp_at(trk$dist, e, b)),
+               colour = cols[i], from = names[i], to = names[i + 1])
+  }))
+}
+
+swatch <- function(hex) sprintf(
+  '<span style="display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;background:%s"></span>', hex)
+
 # Minetti et al. (2002) energy cost of running, J/kg/m, for grade i (rise/run,
 # decimal). The polynomial was fit over -0.45..+0.45, so grades are clamped.
 minetti_cr <- function(i) {
@@ -88,12 +136,12 @@ minetti_cr <- function(i) {
 }
 MINETTI_CR0 <- minetti_cr(0)  # 3.6 J/kg/m on the flat
 
-# Split the course into equal chunks of about `seg_mi`, take each chunk's grade
-# from its endpoint elevations, and weight its length by Cr(i) / Cr(0).
-# Returns one row per chunk with a running total of flat-equivalent miles.
-flat_equivalent <- function(d, e, seg_mi) {
+# Split the route into equal intervals of about `int_mi`, take each interval's
+# grade from its endpoint elevations, and weight its length by Cr(i) / Cr(0).
+# Returns one row per interval with a running total of flat-equivalent miles.
+flat_equivalent <- function(d, e, int_mi) {
   total  <- max(d)
-  n      <- max(1, round(total / seg_mi))
+  n      <- max(1, round(total / int_mi))
   br     <- seq(0, total, length.out = n + 1)
   z      <- interp_at(d, e, br)                  # ft
   run_ft <- diff(br) * FT_PER_MI
@@ -126,7 +174,7 @@ mile_splits <- function(d, e, fe = NULL) {
     net <- ys[length(ys)] - ys[1]
     data.frame(
       Mile         = label,
-      Segment      = sprintf("%.2f \u2013 %.2f mi", a, b),
+      Miles        = sprintf("%.2f \u2013 %.2f", a, b),
       `Gain (ft)`  = sprintf("+%.0f", gl[["gain"]]),
       `Loss (ft)`  = sprintf("\u2212%.0f", gl[["loss"]]),
       `Net (ft)`   = sprintf("%+.0f", net),
@@ -175,7 +223,7 @@ locate_marks <- function(trk, e, marks) {
 }
 
 # Nearest point on the track to a clicked lat/lng: returns its distance (mi),
-# or NA if the click was more than `max_m` meters from the course.
+# or NA if the click was more than `max_m` meters from the route.
 nearest_dist <- function(trk, lat, lng, max_m = 150) {
   m <- haversine_m(lat, lng, trk$lat, trk$lon)
   i <- which.min(m)
@@ -203,6 +251,9 @@ build_profile <- function(trk, e, mk, show_raw = FALSE, relative = FALSE,
                           title = NULL, subtitle = NULL) {
   base <- if (relative) e[1] else 0
   df <- data.frame(dist = trk$dist, ele = e - base, raw = trk$ele_ft - base)
+  sec <- split_segments(trk, e - base, mk)
+  sec$segment <- factor(sec$segment)
+  sec_cols <- setNames(unique(sec$colour), levels(sec$segment))
   if (!is.null(mk)) mk$ele_ft <- mk$ele_ft - base
 
   yr  <- range(if (show_raw) c(df$ele, df$raw) else df$ele)
@@ -210,9 +261,14 @@ build_profile <- function(trk, e, mk, show_raw = FALSE, relative = FALSE,
   ylo <- yr[1] - pad
   yhi <- yr[2] + pad
 
+  # The filled area carries the segment color (the pale end of the ramp would
+  # vanish as a thin line on white); a dark line on top keeps the profile crisp.
   p <- ggplot(df, aes(dist)) +
-    geom_ribbon(aes(ymin = ylo, ymax = ele), fill = "#3b82f6", alpha = 0.18) +
-    geom_line(aes(y = ele), colour = "#1d4ed8", linewidth = 0.9)
+    geom_ribbon(data = sec, aes(x = dist, ymin = ylo, ymax = ele,
+                                fill = segment, group = segment),
+                alpha = 0.9, inherit.aes = FALSE) +
+    scale_fill_manual(values = sec_cols, guide = "none") +
+    geom_line(aes(y = ele), colour = "#1f2937", linewidth = 0.8)
 
   if (show_raw) {
     p <- p + geom_line(aes(y = raw), colour = "grey50", linewidth = 0.3, alpha = 0.7)
@@ -246,9 +302,9 @@ build_profile <- function(trk, e, mk, show_raw = FALSE, relative = FALSE,
           plot.subtitle = element_text(colour = "grey35"))
 }
 
-# Write the course line, start/finish and marks as KML (Google Earth, Google
+# Write the route line, start/finish and marks as KML (Google Earth, Google
 # My Maps, CalTopo, Gaia, etc.). KML colors are aabbggrr hex.
-write_course_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
+write_route_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
   hex_to_kml <- function(hex, alpha = "ff") {
     h <- sub("^#", "", hex)
     paste0(alpha, substr(h, 5, 6), substr(h, 3, 4), substr(h, 1, 2))
@@ -260,7 +316,7 @@ write_course_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
   xml_add_child(d, "name", name)
   gl <- gain_loss(e)
   xml_add_child(d, "description", sprintf(
-    "%.2f mi, +%.0f ft / -%.0f ft%s. Exported from Race Course Analyzer.",
+    "%.2f mi, +%.0f ft / -%.0f ft%s. Exported from Grade Expectations.",
     max(trk$dist), gl[["gain"]], gl[["loss"]], if (trimmed) " (trimmed)" else ""))
 
   add_point_style <- function(id, hex, scale = 1) {
@@ -271,7 +327,7 @@ write_course_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
     xml_add_child(xml_add_child(is, "Icon"), "href", icon_href)
     xml_add_child(xml_add_child(st, "LabelStyle"), "scale", 0.9)
   }
-  ls <- xml_add_child(xml_add_child(d, "Style", id = "course"), "LineStyle")
+  ls <- xml_add_child(xml_add_child(d, "Style", id = "route"), "LineStyle")
   xml_add_child(ls, "color", hex_to_kml("#1d4ed8"))
   xml_add_child(ls, "width", 4)
   add_point_style("start",  "#16a34a", 1.2)
@@ -291,11 +347,11 @@ write_course_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
     xml_add_child(pt, "coordinates", coord(lon, lat, ele_ft))
   }
 
-  # Course
-  f  <- xml_add_child(d, "Folder"); xml_add_child(f, "name", "Course")
+  # Route
+  f  <- xml_add_child(d, "Folder"); xml_add_child(f, "name", "Route")
   pm <- xml_add_child(f, "Placemark")
   xml_add_child(pm, "name", name)
-  xml_add_child(pm, "styleUrl", "#course")
+  xml_add_child(pm, "styleUrl", "#route")
   line <- xml_add_child(pm, "LineString")
   xml_add_child(line, "tessellate", 1)
   xml_add_child(line, "altitudeMode", "clampToGround")
@@ -370,6 +426,16 @@ ui <- fluidPage(
     .add-btn { height: 34px; padding: 0 12px; border: 0; border-radius: 4px;
       background: #1d4ed8; color: #fff; font-weight: 600; cursor: pointer; }
     .add-btn:hover { background: #1e40af; }
+    .add-btn:disabled, .add-row input:disabled { background: #e5e7eb; color: #9ca3af;
+      cursor: not-allowed; }
+    .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+      margin: 4px 0 4px; font-size: 13px; color: #374151;
+      font-variant-numeric: tabular-nums; }
+    .legend-title { font-size: 12px; color: #6b7280; text-transform: uppercase;
+      letter-spacing: .04em; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .legend-swatch { width: 22px; height: 12px; border-radius: 3px; }
+    .mark-count { font-weight: 400; color: #6b7280; }
     .mark-msg { min-height: 1.3em; font-size: 13px; color: #b45309; margin: 4px 0; }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
     .chip { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px 2px 10px;
@@ -398,7 +464,7 @@ ui <- fluidPage(
     table { width: 100%; }
   "))),
 
-  titlePanel("Race Course Analyzer"),
+  titlePanel("Grade Expectations"),
 
   sidebarLayout(
     sidebarPanel(
@@ -406,7 +472,8 @@ ui <- fluidPage(
       fileInput("gpx", "Upload a GPX file", accept = c(".gpx")),
       uiOutput("trim_ui"),
 
-      tags$label(class = "marks-label", `for` = "new-mark", "Marks"),
+      tags$label(class = "marks-label", `for` = "new-mark", "Marks ",
+                 span(class = "mark-count", textOutput("mark_count", inline = TRUE))),
       div(class = "add-row",
           tags$input(id = "new-mark", type = "number", min = "0", step = "0.25",
                      placeholder = "e.g. 1.5", inputmode = "decimal"),
@@ -421,7 +488,7 @@ ui <- fluidPage(
           actionLink("preset_half", "every \u00bd mi"),
           actionLink("preset_km",   "every km"),
           actionLink("clear_marks", "clear all")),
-      helpText("Or click the course on the map, or the elevation chart,",
+      helpText("Or click the route on the map, or the elevation chart,",
                "to add a mark at that spot."),
       hr(),
       sliderInput("smooth_ft", "Elevation smoothing window (ft)",
@@ -431,17 +498,18 @@ ui <- fluidPage(
                "numbers. Set to 0 to use raw elevations."),
       checkboxInput("show_raw", "Show raw elevation on chart", FALSE),
       hr(),
-      sliderInput("grade_seg_ft", "Flat-equivalent segment length (ft)",
+      sliderInput("grade_int_ft", "Flat-equivalent interval (ft)",
                   min = 25, max = 1320, value = 200, step = 25),
       helpText("Flat-equivalent distance uses Minetti's energy cost of running",
-               "vs. grade (the physiology behind Strava's GAP). The course is",
-               "cut into equal segments of about this length; each counts as",
-               "its length \u00d7 Cr(grade) / Cr(0). Shorter segments catch",
+               "vs. grade (the physiology behind Strava's GAP). The route is",
+               "cut into equal intervals of about this length; each counts as",
+               "its length \u00d7 Cr(grade) / Cr(0). Shorter intervals catch",
                "short, steep hills but are more sensitive to GPS noise.")
     ),
 
     mainPanel(
       width = 9,
+      uiOutput("segment_legend"),
       uiOutput("summary"),
 
       div(class = "panel-box",
@@ -464,9 +532,9 @@ ui <- fluidPage(
 
       div(class = "panel-box",
           div(class = "panel-head",
-              h4("Course map"),
+              h4("Route map"),
               uiOutput("download_kml_ui")),
-          div(class = "hint", "Click anywhere on the course to drop a mark.",
+          div(class = "hint", "Click anywhere on the route to drop a mark.",
               "Hover the elevation chart to see that spot here."),
           leafletOutput("map", height = "500px")),
 
@@ -542,6 +610,13 @@ ui <- fluidPage(
         if (x) Shiny.setInputValue('remove_mark', x.getAttribute('data-key'),
                                    { priority: 'event' });
       });
+      Shiny.addCustomMessageHandler('marks-full', function(full) {
+        var el = document.getElementById('new-mark');
+        var btn = document.getElementById('add-mark-btn');
+        el.disabled = btn.disabled = full;
+        el.placeholder = full ? 'Limit reached' : 'e.g. 1.5';
+        btn.title = full ? 'Remove a mark to add another' : '';
+      });
       document.addEventListener('keydown', function(e) {
         if (e.target.id === 'new-mark' && e.key === 'Enter') { e.preventDefault(); send(); }
       });
@@ -563,7 +638,7 @@ server <- function(input, output, session) {
 
   # ---- Trim: drop a warm-up before the start or a late watch stop ----
   # The chosen range is stored with the file it belongs to, so a newly
-  # uploaded course always starts untrimmed.
+  # uploaded route always starts untrimmed.
   trim_state <- reactiveVal(NULL)
   trim_in    <- debounce(reactive(input$trim), 250)
   observeEvent(trim_in(), {
@@ -587,7 +662,7 @@ server <- function(input, output, session) {
     req(input$gpx)
     req(tryCatch(raw_track(), error = function(e) NULL))
     div(class = "trim-box",
-        sliderInput("trim", "Trim course (mi)", min = 0, max = slider_max(),
+        sliderInput("trim", "Trim route (mi)", min = 0, max = slider_max(),
                     value = c(0, slider_max()), step = 0.01, ticks = FALSE,
                     width = "100%"),
         uiOutput("trim_note"))
@@ -610,13 +685,13 @@ server <- function(input, output, session) {
   })
 
   # Smooth the full recording first, so the trimmed ends don't suffer edge
-  # effects, then cut. Everything downstream works on the trimmed course,
+  # effects, then cut. Everything downstream works on the trimmed route,
   # with distance re-zeroed at the new start.
   track <- reactive({
     trk <- raw_track()
     trk$ele_s <- smooth_by_distance(trk$dist, trk$ele_ft, input$smooth_ft / FT_PER_MI)
     r <- trim_range()
-    validate(need(diff(r) >= 0.05, "The trimmed course is too short; widen the trim range."))
+    validate(need(diff(r) >= 0.05, "The trimmed route is too short; widen the trim range."))
     trim_track(trk, r[1], r[2])
   })
 
@@ -624,7 +699,7 @@ server <- function(input, output, session) {
 
   flat_eq <- reactive({
     trk <- track()
-    flat_equivalent(trk$dist, ele(), input$grade_seg_ft / FT_PER_MI)
+    flat_equivalent(trk$dist, ele(), input$grade_int_ft / FT_PER_MI)
   })
 
   # ---- Marks: one list, edited by the add row, presets, chips and clicks ----
@@ -633,20 +708,28 @@ server <- function(input, output, session) {
   undo_marks <- reactiveVal(NULL)
   mark_msg   <- reactiveVal(NULL)
 
-  course_total <- reactive({
+  route_total <- reactive({
     if (is.null(input$gpx)) return(NA_real_)
     tryCatch(max(track()$dist), error = function(e) NA_real_)
   })
 
   # Add marks, skipping duplicates and anything past the finish.
   # Returns a message for a single rejected mark, or NULL.
+  # Also enforces MAX_MARKS: a request that would go over adds nothing.
   add_marks <- function(new, quiet = FALSE) {
     cur   <- marks()
-    total <- course_total()
+    total <- route_total()
     mi    <- marks_to_mi(new)
     dup   <- round(mi, 3) %in% round(marks_to_mi(cur), 3) | duplicated(round(mi, 3))
     past  <- !is.na(total) & mi > total + 1e-6
     ok    <- !dup & !past
+    if (nrow(cur) + sum(ok) > MAX_MARKS) {
+      return(if (nrow(new) == 1)
+        sprintf("You're at the limit of %d marks (%d color-coded segments). Remove one to add another.",
+                MAX_MARKS, MAX_SEGMENTS)
+      else sprintf("That would make %d marks; the limit is %d so each segment keeps a distinct color. Clear some first.",
+                   nrow(cur) + sum(ok), MAX_MARKS))
+    }
     marks(rbind(cur, new[ok, , drop = FALSE]))
     if (quiet || nrow(new) != 1 || ok) return(NULL)
     lab <- mark_label(new$value, new$unit)
@@ -684,10 +767,9 @@ server <- function(input, output, session) {
   })
 
   quick_add <- function(kind) {
-    total <- course_total()
-    if (is.na(total)) total <- 3.1   # before a course is loaded, assume a 5K
-    add_marks(preset_marks(kind, total), quiet = TRUE)
-    mark_msg(NULL)
+    total <- route_total()
+    if (is.na(total)) total <- 3.1   # before a route is loaded, assume a 5K
+    mark_msg(add_marks(preset_marks(kind, total), quiet = TRUE))
   }
   observeEvent(input$preset_mile, quick_add("mile"))
   observeEvent(input$preset_half, quick_add("half"))
@@ -711,16 +793,21 @@ server <- function(input, output, session) {
     } else div(class = "mark-msg", msg)
   })
 
+  output$mark_count <- renderText(sprintf("(%d of %d)", nrow(marks()), MAX_MARKS))
+  observe({
+    session$sendCustomMessage("marks-full", nrow(marks()) >= MAX_MARKS)
+  })
+
   output$mark_chips <- renderUI({
     m <- marks()
     if (nrow(m) == 0) return(div(class = "chips chips-empty", "No marks yet."))
     m$mi <- marks_to_mi(m)
     m <- m[order(m$mi), , drop = FALSE]
-    total <- course_total()
+    total <- route_total()
     div(class = "chips", lapply(seq_len(nrow(m)), function(i) {
       out <- !is.na(total) && m$mi[i] > total + 1e-6
       span(class = paste("chip", if (m$unit[i] == "km") "km", if (out) "out"),
-           title = if (out) "Past the finish of this course" else NULL,
+           title = if (out) "Past the finish of this route" else NULL,
            mark_label(m$value[i], m$unit[i]),
            tags$button(type = "button", `data-key` = mark_key(m$value[i], m$unit[i]),
                        title = "Remove", "\u00d7"))
@@ -731,9 +818,22 @@ server <- function(input, output, session) {
     trk <- track()
     m <- marks()
     df <- data.frame(mile = marks_to_mi(m), label = mark_label(m$value, m$unit),
-                     colour = ifelse(m$unit == "km", "#4338ca", "#dc2626"))
+                     colour = rep("#1f2937", nrow(m)))
     df <- df[df$mile <= max(trk$dist) + 1e-6, , drop = FALSE]
     locate_marks(trk, ele(), df[order(df$mile), , drop = FALSE])
+  })
+
+  # Color key for the route segments, shared by the chart and the map
+  output$segment_legend <- renderUI({
+    sec <- split_segments(track(), ele(), markers())
+    sec <- sec[!duplicated(sec$segment), , drop = FALSE]
+    div(class = "legend",
+        span(class = "legend-title", "Segments"),
+        lapply(seq_len(nrow(sec)), function(i) {
+          span(class = "legend-item",
+               span(class = "legend-swatch", style = paste0("background:", sec$colour[i])),
+               sprintf("%s \u2013 %s", sec$from[i], sec$to[i]))
+        }))
   })
 
   output$summary <- renderUI({
@@ -763,7 +863,7 @@ server <- function(input, output, session) {
     build_profile(track(), ele(), markers(), input$show_raw, relative())
   })
 
-  course_name <- reactive({
+  route_name <- reactive({
     req(input$gpx)
     tools::file_path_sans_ext(input$gpx$name)
   })
@@ -779,16 +879,16 @@ server <- function(input, output, session) {
   })
 
   output$download_kml <- downloadHandler(
-    filename = function() paste0(course_name(), "-course.kml"),
+    filename = function() paste0(route_name(), "-route.kml"),
     content = function(file) {
-      write_course_kml(file, track(), ele(), markers(), course_name(),
+      write_route_kml(file, track(), ele(), markers(), route_name(),
                        trimmed = is_trimmed())
     },
     contentType = "application/vnd.google-earth.kml+xml"
   )
 
   output$download_profile <- downloadHandler(
-    filename = function() paste0(course_name(), "-elevation.png"),
+    filename = function() paste0(route_name(), "-elevation.png"),
     content = function(file) {
       trk <- track(); e <- ele(); gl <- gain_loss(e)
       range_txt <- if (relative()) {
@@ -796,7 +896,7 @@ server <- function(input, output, session) {
       } else sprintf("%.0f\u2013%.0f ft", min(e), max(e))
       p <- build_profile(
         trk, e, markers(), input$show_raw, relative(),
-        title    = course_name(),
+        title    = route_name(),
         subtitle = sprintf("%.2f mi (%.2f flat-eq)  \u00b7  +%.0f ft / \u2212%.0f ft  \u00b7  %s",
                            max(trk$dist), sum(flat_eq()$equiv),
                            gl[["gain"]], gl[["loss"]], range_txt)
@@ -844,8 +944,11 @@ server <- function(input, output, session) {
 
   output$markers <- renderTable({
     mk <- markers()
-    validate(need(!is.null(mk), "No marks yet. Type distances or click the course."))
+    validate(need(!is.null(mk), "No marks yet. Type distances or click the route."))
+    cols <- segment_colours(nrow(mk) + 1 -
+                            sum(mk$mile >= max(track()$dist) - 1e-6))
     out <- data.frame(
+      ` `           = swatch(cols[seq_len(nrow(mk))]),
       Mark          = mk$label,
       `Dist (mi)`   = sprintf("%.2f", mk$mile),
       Elev          = if (relative()) signed_ft(mk$ele_ft - base_ft())
@@ -855,33 +958,41 @@ server <- function(input, output, session) {
       Lon           = sprintf("%.5f", mk$lon),
       check.names = FALSE
     )
-    names(out)[3] <- if (relative()) "vs. start (ft)" else "Elev (ft)"
+    names(out)[4] <- if (relative()) "vs. start (ft)" else "Elev (ft)"
     out
-  }, striped = TRUE, align = "lrrrrr")
+  }, striped = TRUE, align = "clrrrrr", sanitize.text.function = identity)
 
-  # ---- Map: drawn once per course; marks and hover dot update in place ----
+  # ---- Map: drawn once per route; marks and hover dot update in place ----
 
   add_marks_layer <- function(m, mk) {
     m <- clearGroup(m, "marks")
     if (is.null(mk)) return(m)
     addCircleMarkers(m, lng = mk$lon, lat = mk$lat, group = "marks",
-                     radius = 6, color = mk$colour, fillColor = "#fff",
+                     radius = 6, color = "#1f2937", fillColor = "#fff",
                      weight = 3, fillOpacity = 1, label = mk$label,
                      labelOptions = labelOptions(noHide = TRUE, direction = "right",
                                                  textsize = "12px"))
   }
 
-  # The (trimmed) course line with its start and finish dots
-  add_course_layer <- function(m, trk) {
-    m <- clearGroup(m, "course")
+  # The (trimmed) route line, colored by segment, with start and finish dots.
+  # A white casing underneath separates the line from any basemap.
+  add_route_layer <- function(m, trk, e, mk) {
+    m <- clearGroup(m, "route")
     n <- nrow(trk)
+    m <- addPolylines(m, lng = trk$lon, lat = trk$lat, color = "#ffffff",
+                      group = "route", weight = 9, opacity = 0.9,
+                      options = pathOptions(interactive = FALSE))
+    sec <- split_segments(trk, e, mk)
+    for (s in split(sec, sec$segment)) {
+      m <- addPolylines(m, lng = s$lon, lat = s$lat, color = s$colour[1],
+                        group = "route", weight = 5, opacity = 1,
+                        label = sprintf("%s \u2192 %s", s$from[1], s$to[1]))
+    }
     m |>
-      addPolylines(lng = trk$lon, lat = trk$lat, color = "#1d4ed8", group = "course",
-                   weight = 5, opacity = 0.85) |>
-      addCircleMarkers(lng = trk$lon[1], lat = trk$lat[1], radius = 7, group = "course",
+      addCircleMarkers(lng = trk$lon[1], lat = trk$lat[1], radius = 7, group = "route",
                        color = "#16a34a", fillOpacity = 1, stroke = FALSE,
                        label = "Start") |>
-      addCircleMarkers(lng = trk$lon[n], lat = trk$lat[n], radius = 7, group = "course",
+      addCircleMarkers(lng = trk$lon[n], lat = trk$lat[n], radius = 7, group = "route",
                        color = "#111827", fillOpacity = 1, stroke = FALSE,
                        label = "Finish")
   }
@@ -900,12 +1011,12 @@ server <- function(input, output, session) {
       addPolylines(lng = raw$lon, lat = raw$lat, color = "#6b7280", weight = 3,
                    opacity = 0.8, dashArray = "4 6", label = "Trimmed off",
                    options = pathOptions(interactive = FALSE))
-    m <- add_course_layer(m, isolate(track()))
+    m <- add_route_layer(m, isolate(track()), isolate(ele()), isolate(markers()))
     add_marks_layer(m, isolate(markers()))
   })
 
   observe({
-    m <- add_course_layer(leafletProxy("map"), track())
+    m <- add_route_layer(leafletProxy("map"), track(), ele(), markers())
     add_marks_layer(m, markers())
   })
 
