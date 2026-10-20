@@ -246,6 +246,82 @@ build_profile <- function(trk, e, mk, show_raw = FALSE, relative = FALSE,
           plot.subtitle = element_text(colour = "grey35"))
 }
 
+# Write the course line, start/finish and marks as KML (Google Earth, Google
+# My Maps, CalTopo, Gaia, etc.). KML colors are aabbggrr hex.
+write_course_kml <- function(file, trk, e, mk, name, trimmed = FALSE) {
+  hex_to_kml <- function(hex, alpha = "ff") {
+    h <- sub("^#", "", hex)
+    paste0(alpha, substr(h, 5, 6), substr(h, 3, 4), substr(h, 1, 2))
+  }
+  icon_href <- "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png"
+
+  doc  <- xml_new_root("kml", xmlns = "http://www.opengis.net/kml/2.2")
+  d    <- xml_add_child(doc, "Document")
+  xml_add_child(d, "name", name)
+  gl <- gain_loss(e)
+  xml_add_child(d, "description", sprintf(
+    "%.2f mi, +%.0f ft / -%.0f ft%s. Exported from Race Course Analyzer.",
+    max(trk$dist), gl[["gain"]], gl[["loss"]], if (trimmed) " (trimmed)" else ""))
+
+  add_point_style <- function(id, hex, scale = 1) {
+    st <- xml_add_child(d, "Style", id = id)
+    is <- xml_add_child(st, "IconStyle")
+    xml_add_child(is, "color", hex_to_kml(hex))
+    xml_add_child(is, "scale", scale)
+    xml_add_child(xml_add_child(is, "Icon"), "href", icon_href)
+    xml_add_child(xml_add_child(st, "LabelStyle"), "scale", 0.9)
+  }
+  ls <- xml_add_child(xml_add_child(d, "Style", id = "course"), "LineStyle")
+  xml_add_child(ls, "color", hex_to_kml("#1d4ed8"))
+  xml_add_child(ls, "width", 4)
+  add_point_style("start",  "#16a34a", 1.2)
+  add_point_style("finish", "#111827", 1.2)
+  add_point_style("mark_mi", "#dc2626")
+  add_point_style("mark_km", "#4338ca")
+
+  coord <- function(lon, lat, ele_ft) sprintf("%.7f,%.7f,%.1f", lon, lat, ele_ft / M_TO_FT)
+
+  add_point <- function(parent, nm, style, lon, lat, ele_ft, desc = NULL) {
+    pm <- xml_add_child(parent, "Placemark")
+    xml_add_child(pm, "name", nm)
+    if (!is.null(desc)) xml_add_child(pm, "description", desc)
+    xml_add_child(pm, "styleUrl", paste0("#", style))
+    pt <- xml_add_child(pm, "Point")
+    xml_add_child(pt, "altitudeMode", "clampToGround")
+    xml_add_child(pt, "coordinates", coord(lon, lat, ele_ft))
+  }
+
+  # Course
+  f  <- xml_add_child(d, "Folder"); xml_add_child(f, "name", "Course")
+  pm <- xml_add_child(f, "Placemark")
+  xml_add_child(pm, "name", name)
+  xml_add_child(pm, "styleUrl", "#course")
+  line <- xml_add_child(pm, "LineString")
+  xml_add_child(line, "tessellate", 1)
+  xml_add_child(line, "altitudeMode", "clampToGround")
+  xml_add_child(line, "coordinates",
+                paste(coord(trk$lon, trk$lat, e), collapse = " "))
+  n <- nrow(trk)
+  add_point(f, "Start",  "start",  trk$lon[1], trk$lat[1], e[1],
+            sprintf("Elevation %.0f ft", e[1]))
+  add_point(f, "Finish", "finish", trk$lon[n], trk$lat[n], e[n],
+            sprintf("%.2f mi, elevation %.0f ft", max(trk$dist), e[n]))
+
+  # Marks
+  if (!is.null(mk) && nrow(mk) > 0) {
+    f <- xml_add_child(d, "Folder"); xml_add_child(f, "name", "Marks")
+    for (i in seq_len(nrow(mk))) {
+      add_point(f, mk$label[i],
+                if (grepl("km$", mk$label[i])) "mark_km" else "mark_mi",
+                mk$lon[i], mk$lat[i], mk$ele_ft[i],
+                sprintf("%.2f mi (%.2f km). Elevation %.0f ft (%s ft vs. start, %+.0f ft since previous mark).",
+                        mk$mile[i], mk$mile[i] / KM_TO_MI, mk$ele_ft[i],
+                        signed_ft(mk$ele_ft[i] - e[1]), mk$change[i]))
+    }
+  }
+  write_xml(doc, file, options = c("format", "as_xml"))
+}
+
 stat_card <- function(label, value, note = NULL) {
   div(class = "stat",
       div(class = "stat-value", value),
@@ -387,7 +463,9 @@ ui <- fluidPage(
           div(class = "hover-info", textOutput("hover_info"))),
 
       div(class = "panel-box",
-          h4("Course map"),
+          div(class = "panel-head",
+              h4("Course map"),
+              uiOutput("download_kml_ui")),
           div(class = "hint", "Click anywhere on the course to drop a mark.",
               "Hover the elevation chart to see that spot here."),
           leafletOutput("map", height = "500px")),
@@ -694,6 +772,20 @@ server <- function(input, output, session) {
     req(input$gpx)
     downloadButton("download_profile", "Download PNG", class = "btn-default btn-sm")
   })
+
+  output$download_kml_ui <- renderUI({
+    req(input$gpx)
+    downloadButton("download_kml", "Download KML", class = "btn-default btn-sm")
+  })
+
+  output$download_kml <- downloadHandler(
+    filename = function() paste0(course_name(), "-course.kml"),
+    content = function(file) {
+      write_course_kml(file, track(), ele(), markers(), course_name(),
+                       trimmed = is_trimmed())
+    },
+    contentType = "application/vnd.google-earth.kml+xml"
+  )
 
   output$download_profile <- downloadHandler(
     filename = function() paste0(course_name(), "-elevation.png"),
